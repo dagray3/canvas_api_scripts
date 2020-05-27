@@ -1,0 +1,457 @@
+//Canvas Team Formation V2
+//David Gray 5/27/20, dagray3@vt.edu
+//EngE Department, Virgnia Tech
+//this script has two tools that work together to enable automated uploading of CATME-generated teams to a Canvas course.
+//thre is no error handling here, and some of the features are clunky
+//v2 does not feature OAuth2, and is there technically not ready for distrubtion
+//'Download Canvas Roster', 'getStudents' functions to download all users from a canvas site
+//            loads [ID,pid,email,Sortable Name,last name,first name]
+//            only ID and email are used by this script.  emails are keyed from CATME downloads
+//            to crosslink and find Canvas ID for student upload to teams
+//
+//'Upload CATME Teams','populateGroups' functions to use a csv imported team formation from a CATME team survey
+//            user enters a group Set name (e.g. project groups, module 2 groups, actvity X groups)
+//            the script then checks to see if the group set already exists in canvas, and creates it if it does not exist
+//            it then verifies that all the groups exist within that group set.  if the groups do not exist in canvas, the script creates them
+//            finally, the script uploads all members of each CATME team to the correct group on Canvas.  the tool rewrites each team every execution
+//
+//please send questions or comments to dagray3@vt.edu 
+
+//----------------------------------------------------------------------------------
+function onOpen() {
+  // Adds a custom menu to the spreadsheet.
+  SpreadsheetApp.getUi()
+  .createMenu('Canvas Teams')
+  .addItem('Download Canvas Roster', 'getStudents')
+  .addItem('Upload CATME Teams','populateGroups')
+  .addToUi();
+};//end of onOpen--------------------------------------------------------------------
+
+
+
+//---------------------------------------------------------------------------
+function getStudents(){
+  //downloads students from Canvas Roster
+
+  var courseID=  getID();//get the course ID from the current spreadsheet
+  var token = getAuth();//find security token - replace with OAuth2 in next version
+  
+  var options =
+      {
+        "method"  : "GET",
+        "enrollment_type": "student",
+        "headers"    : {'accept': 'application/json',
+          'content-type': 'application/json',"Authorization": "Bearer " +token},
+        "followRedirects" : true,
+      "muteHttpExceptions": true
+      };
+  var canURL = 'https://canvas.vt.edu/api/v1/courses/';
+  var methodURL = '/users'
+  var courseURL = canURL+courseID+methodURL;
+  var result = fetchPages(courseURL,options);//get all students
+ 
+  //generate an array of students and their properties and identifiers by parsing the results of the GET call above
+  var firstRow=8;//make this automatic - for now just go with manual
+  var canvasStudents = []
+  
+  for (i=0;i<result.length;i++){  
+    if(result[i]){
+      var ID = result[i].id;
+      var email = result[i].email;
+      canvasStudents[i]=[ID,'',email,result[i].name];
+    }
+  }  
+
+  SpreadsheetApp.getActive().getSheetByName('Canvas_Download').getRange( firstRow,1,canvasStudents.length,canvasStudents[0].length).setValues(canvasStudents)//write the names into the Canvas Download sheet
+
+  sheetLog("Imported Canvas roster for course "+courseID)
+  
+}//end of canvas roster download---------------------------------------------------------------
+
+//-------------------------------------------------------------
+//main upload function.
+
+function populateGroups(){
+  //user defines groupSet name in CATME import sheet
+  //code will check CATME sheet for group set name (user defined)
+  //then check in Canvas to see if that groupset already exists
+  //if !groupSet, create it - this will NOT overwrite groupSets already with that name in Canvas
+  //in the groupset, create all the catme groups
+  //update their membership.  This will repopulate groups even if they already exist
+  
+  //set some options to pass to subroutines to speed up performance by lmiting the number of sheet calls
+  var courseOpts = {
+    'token':getAuth(),
+    'courseID':getID()
+  }
+      
+  var groupSetName = getGroupSetName();//get groupe set name from CatME import sheet
+  var groupSetID = createGroupSet(groupSetName,courseOpts);//check for groupSet in Canvas.  Create if !GroupSet.  Get setID
+  
+  //find all unique group names in the CatME import
+  //get the team names column in the CatME sheet and find all unique values
+  var sheet = SpreadsheetApp.getActive().getSheetByName('CATME Import');
+  var startRow = sheet.getRange(3,9).getValue();
+  var groupCol = sheet.getRange(4,9).getValue();
+  var startCol = 1;
+  var emailCol = sheet.getRange(5,9);//update these to pull from user input on sheet
+  var range = sheet.getRange(startRow,groupCol,sheet.getLastRow())
+  var groupNames = sheet.getRange(startRow, groupCol,sheet.getLastRow()).getValues().flat()
+  groupNames=groupNames.filter(e => String(e).trim()); //https://codeburst.io/javascript-array-distinct-5edc93501dc4
+  groupNames=[...new Set(groupNames)]
+  //create groups within the course groupset on canvas
+  
+  var courseGroups = getSetGroups(groupSetID,courseOpts)//fetch all groups within the groupSetID
+  
+  //parse the set to generate an arry of objects of existing groups
+  //generate object with form {'name':name,"id:id"}
+  var existGroups = [];
+  for (i=0;i<courseGroups.length;i++){
+    if(courseGroups[i]){
+      existGroups.push({'name':courseGroups[i].name,'ID':courseGroups[i].id})
+    }
+  }
+  
+  //for each groupName
+  //check if group exists in canvas
+  //if !groupName, create it
+  //when group is created, get its id
+  for (j=0;j<groupNames.length;j++)
+  {
+    if(!existGroups.find(o => o.name === groupNames[j]))
+    {
+      createGroup(groupSetID,groupNames[j],courseOpts)
+    }
+  }
+  
+ // repopulate the group list in case new groups were added
+  var courseGroups = getSetGroups(groupSetID,courseOpts)//fetch all groups within the groupSetID
+  var existGroups = [];
+  for (i=0;i<courseGroups.length;i++){
+    if(courseGroups[i])
+    {
+      existGroups.push({'name':courseGroups[i].name,'ID':courseGroups[i].id})
+    }
+  }//returns the names of the groups in the groupset on canvas already
+ 
+  //need to generate a list of group members for each group
+  //we need to compare the canvas download parameters with the CatME import parameters to generate a list of
+  //team names (pulled from CatME list) and student Canvas ID (pulled from Canvas download)
+  
+  var canStartRow = 8;//where does the canvas imported data start? -> need to automate this
+  var canStartCol = 1;
+  var canSheet =SpreadsheetApp.getActive().getSheetByName('Canvas_Download');
+  var canvasStudents = canSheet.getRange(canStartRow, canStartCol,canSheet.getLastRow()-canStartRow+1,canSheet.getLastColumn()-canStartCol+1).getValues();
+  
+  var catStudents = sheet.getRange(startRow,startCol,sheet.getLastRow()-startRow,sheet.getLastColumn()-startCol).getValues();
+  
+
+  //for each group in the groupNames array, find all students in the group
+  //the email address persists between catme and canvas and will be used as a key to find the students
+  //for each group, find all catme students in that group
+  //for each catme student, match their address in the canvas group and return their canvasid
+
+  for (j=0;j<groupNames.length;j++)
+  {
+    var members = [];
+    for (k=0;k<catStudents.length;k++)
+    {
+      if(catStudents[k].includes(groupNames[j]))//check if the a student is within the group
+      {
+      var email = catStudents[k][emailCol-1];
+        for(l=0;l<canvasStudents.length;l++)
+        {
+          if(canvasStudents[l].includes(email))
+          {
+            members.push(canvasStudents[l][0])
+          }
+        }
+      }
+    }
+    // populate the group
+     var groupID = existGroups.find(o => o.name === groupNames[j]).ID
+     editGroup(groupID,members,courseOpts)
+     sheetLog('Updated Group '+groupNames[j]+' '+groupID+' membership')
+  
+  }
+      
+}//end of populate groups----------------------------------------
+
+
+
+//-----------------------------------------------
+  function fetchPages(url,options){//fetches all pages of the response from a fetchURL command
+    var result = UrlFetchApp.fetch(url,options);
+    if (result.getResponseCode() == 200){
+     var params = JSON.parse(result.getContentText());
+      var headerList= result.getHeaders().Link.replace(/</g,'').replace(/>/g,'').split(',');
+        for (i=0;i<headerList.length;i++){
+          if (headerList[i].search('next')>-1){
+            var nextURL = headerList[i].split(';')[0];
+            var tempArray=fetchPages(nextURL,options);
+          }     
+        }    
+    }
+    
+  return params.concat(tempArray)
+  
+  }//end of fetchpages-----------------------------------------
+
+
+
+
+//----------------------------------------------------------------
+function createGroupSet(groupSetName,courseOpts){
+  //this function creates a group set with the name supplied in the CATME Import sheet
+  //if the groupset already exists, just get the ID
+
+  var canURL = 'https://canvas.vt.edu/api/v1/courses/';
+
+  //check if groupsetexits
+  var sets = getGroupSets(courseOpts);//query ALL group sets for the course
+ 
+  var groupSetNames =[];//need to parse the sets and generate a list of seet names
+    for (i=0;i<sets.length;i++){
+    if (sets[i]){groupSetNames.push(sets[i].name)}
+  }  
+  
+  if (groupSetNames.indexOf(groupSetName)==-1){//if our set name is not on the list, generate the set
+    var data = {'name':groupSetName};
+    var options ={
+      "method" : "POST",
+      'payload':JSON.stringify(data),
+      "headers": {
+        'accept'       : 'application/json',
+        'content-type' : 'application/json',
+        "Authorization": "Bearer " +courseOpts.token,
+      },
+      "followRedirects"   : true,
+      "muteHttpExceptions": true
+      };
+    var methodURL = '/group_categories'
+    var courseURL = canURL+courseOpts.courseID+methodURL;
+    var response = UrlFetchApp.fetch(courseURL,options);//create the groupset in canvas
+    
+    var sets = getGroupSets(courseOpts);//repopulate the list of groups sets in order to get the setID
+    var groupSetNames =[];
+    for (i=0;i<sets.length;i++){
+      if (sets[i])
+      {
+        groupSetNames.push(sets[i].name)
+      }
+    }
+  sheetLog('Created Canvas GroupSet '+groupSetName+' '+sets[groupSetNames.indexOf(groupSetName)].id)
+  }
+  else
+  {
+    sheetLog('Verified Canvas GroupSet '+groupSetName+' '+sets[groupSetNames.indexOf(groupSetName)].id)
+
+  }
+  var groupSetID = sets[groupSetNames.indexOf(groupSetName)].id//get the set ID for the gorupset we just created  
+  
+  return groupSetID;//send the group set id back for use in the group generation
+  
+}//end of create groupset--------------------------------------------------------
+
+
+
+//---------------------------------------------------------------------------------
+function importCATME (e)
+{
+//create import tab in currenct spreadsheet
+  
+  //import csv
+  //https://www.weirdgeek.com/2019/07/import-csv-file-data-to-google-spreadsheet-using-google-apps-script/
+  
+}//end of importcsv----------------------------------------------------------------
+
+
+
+
+//------------------------------------------------------------------------------------
+function getAuth(){
+  //need to replace with OAuth2
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Admin')
+  var token = sheet.getRange("B2").getValue()
+  return token; 
+}//end of get auth---------------------------------------------------------------------
+
+
+
+//-------------------------------------------------------------------------------------
+function getID(){
+  var sheet = SpreadsheetApp.getActive().getSheetByName('Admin');
+  var range =  sheet.getRange(1, 1,sheet.getLastRow(),sheet.getLastColumn());
+  var courseRow = range.createTextFinder('Course ID').findNext().getRow();
+  var courseID=  sheet.getRange(courseRow,2).getValue();
+  return courseID;
+}//end of getID -------------------------------------------------------------------------
+
+
+
+//---------------------------------------------------------------------------------------
+function googleLog(string){
+  //this is for verbose logging.  google docs requires strings for appending paragraph.  I normally
+  //call this function as googleLog(JSON.stringify(string)) to capture logging info
+  //since google apps script logging is garbage
+  var docID = '1fJqTg-ICn-4Z5jKAJ2hj6X-kXMEC9N-6LZIyVjC5--w'//replace with your docID
+  var body = DocumentApp.openById(docID).getBody();
+  body.appendParagraph(new Date().toLocaleString());
+  body.appendParagraph(string);
+  body.appendHorizontalRule();
+}//end of google log------------------------------------------------------------------------
+
+
+
+//--------------------------------------------------------------------------------------------
+function sheetLog(text)
+{//logs general actions into the spreadhseet for debugging later
+if (!SpreadsheetApp.getActive().getSheetByName('Logs')){
+  SpreadsheetApp.getActive().insertSheet("Logs",3);
+    SpreadsheetApp.getActive().getSheetByName('Logs').appendRow(["Date","Function"])
+  }
+  SpreadsheetApp.getActive().getSheetByName('Logs').appendRow([new Date(),text])
+}//end of sheetlog ------------------------------------------------------------------------------
+
+
+
+//----------------------------------------------------------------------------------------------
+function getGroupSetName(){
+  //find the string 'Group Set' in the CatME import sheet and get the name in the next column
+  var sheet = SpreadsheetApp.getActive().getSheetByName('CATME Import');
+  var range = sheet.getRange(1,1,sheet.getLastRow(),sheet.getLastColumn());
+  var nameRow=range.createTextFinder('Group Set').findNext().getRow();
+  var nameCol=range.createTextFinder('Group Set').findNext().getColumn();
+  var groupName = sheet.getRange(nameRow,nameCol+1).getValue();
+  return groupName
+}//end of get groupseet----------------------------------------------------------------------------
+
+
+
+//------------------------------------------------------------------------------------------------
+ function createGroup(groupSetID,groupName,courseOpts){
+  //creates a single group within the groupset specified by ID.  no returns
+  var token =courseOpts.token;
+  var courseID = courseOpts.courseID;
+ 
+  var data = {
+    'name':groupName,
+  };
+ var options = {
+   "method" : "POST",
+   'payload':JSON.stringify(data),
+   "headers": {
+     'accept': 'application/json',
+     'content-type': 'application/json',
+     "Authorization": "Bearer " +token
+   },
+   "followRedirects" : true,
+   "muteHttpExceptions": true
+ };
+  
+  var canURL = 'https://canvas.vt.edu/api/v1/courses/';
+  var methodURL = '/groups'
+  var courseURL ='https://canvas.vt.edu/api/v1/group_categories/'+groupSetID+methodURL;
+  var response = UrlFetchApp.fetch(courseURL,options) //create group via API POST
+
+  sheetLog('Created Canvas Group '+groupName)//log the group formation in the course sheet log
+  
+}//end of create group----------------------------------------------------------------
+
+
+
+//-------------------------------------------------------------------------------------
+function getGroupSets(courseOpts){
+  //get all group sets associated with the course - this will return not only students groups, but assignment groups as well
+  //returns ALL sets
+  var canURL = 'https://canvas.vt.edu/api/v1/courses/';
+  var getOptions = {
+    "method"  : "GET",
+    "headers" : {'accept': 'application/json',
+                 'content-type': 'application/json',
+                 "Authorization": "Bearer " +courseOpts.token
+                },
+    "followRedirects" : true,
+    "muteHttpExceptions": true
+  };
+  var sets = fetchPages(canURL+courseOpts.courseID+'/group_categories',getOptions)
+  return sets
+
+}//end of getgroupsets------------------------------------------------------------------
+
+
+
+
+//-------------------------------------------------------------------------------------
+function getSetGroups(groupSetID,courseOpts){
+  //returns all groups within a set based on the set ID.  setID exists in canvas beyond course level
+  var token = courseOpts.token;
+  var courseID = courseOpts.courseID;
+  var canURL = 'https://canvas.vt.edu/api/v1';
+  var getOptions = {
+    "method"  : "GET",
+    "headers" : {
+      'accept': 'application/json',
+      'content-type': 'application/json',
+      "Authorization": "Bearer " +token
+    },
+    "followRedirects" : true,
+    "muteHttpExceptions": true
+      };
+  var groups = fetchPages('https://canvas.vt.edu/api/v1/group_categories/'+groupSetID+'/groups',getOptions)
+  return groups
+    
+}//end of getCourseGroups--------------------------------------------------------------
+
+
+
+//--------------------------------------------------------------------------------------
+function editGroup(groupID,students,courseOpts){
+  //modify group based on group ID to contain members in the student array
+  //use Canvas IDs for the student list
+  //this code needs to check for current group membership and update it if it doesn't match the current list
+  var token = courseOpts.token;
+  var courseID = courseOpts.ID;
+ 
+  var data = {
+    "members":students
+  };
+  var headers = {
+    "Authorization": "Bearer " +token,
+    'content-type': 'application/json'
+  };
+  var options = {
+    "method":"PUT",
+    "headers":headers,
+    "payload":JSON.stringify(data),
+    "muteHttpExceptions" : true
+  };
+  
+  //populate group via API PUT
+  var result = UrlFetchApp.fetch('https://canvas.vt.edu/api/v1/groups/'+groupID,options)
+  var response = result.getContentText();
+  var res_code = result.getResponseCode();
+
+}//end of edit group------------------------------------------------------------------------
+
+
+
+
+//--------------------------------------------------------------------------------------------
+function onlyUnique(value, index, self) { 
+    return self.indexOf(value) === index;
+}//end of only unique-----------------------------------------------------------------------------
+
+
+
+
+//------------------------------------------------------------------------------------------
+function getAllIndexes(arr, val) {
+  ///returns all matching cases of a values within an array
+    var indexes = [], i;
+    for(i = 0; i < arr.length; i++)
+        if (arr[i] === val)
+            indexes.push(i);
+    return indexes;
+}//end of getAllIndexes------------------------------------------------------------------------------------------
+
